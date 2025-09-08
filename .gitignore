@@ -354,3 +354,14 @@ configs/live/multigrid.json
 # Reports
 reports/*
 .aider*
+
+
+/backtests
+/historical_data
+/results*
+/configs
+/reports
+/api-keys.json
+/caches
+/optimize_results
+/passivbot-rust/Cargo.lock

@@ -45,5 +45,6 @@ fn passivbot_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hysteresis_rounding, m)?)?;
     m.add_function(wrap_pyfunction!(calc_pprice_diff_int, m)?)?;
     m.add_function(wrap_pyfunction!(backtest_trailing_flip, m)?)?;
+    m.add_function(wrap_pyfunction!(trailing_flip::backtest_trailing_flip_multi, m)?)?;
     Ok(())
 }

@@ -1,5 +1,6 @@
-use numpy::{PyReadonlyArray2, PyReadonlyArray1};
+use numpy::{PyReadonlyArray3 ,PyReadonlyArray2, PyReadonlyArray1};
 use pyo3::prelude::*;
+use ndarray::s;
 
 use crate::utils::{calc_pnl_long, calc_pnl_short};
 
@@ -503,4 +504,256 @@ pub fn backtest_trailing_flip<'py>(
     }
 
     Ok((fills_out, equities))
+}
+
+/// Core logic for a single cycle on one coin, starting at any bar.
+/// Returns (fills, equities, bars_processed)
+fn backtest_trailing_flip_single_cycle(
+    hlcv: &ndarray::ArrayView2<f64>,
+    adx_1: &ndarray::ArrayView1<f64>,
+    adx_2: &ndarray::ArrayView1<f64>,
+    start_balance: f64,
+    initial_qty_pct: f64,
+    double_down_factor: f64,
+    wallet_exposure_limit: f64,
+    trailing_threshold_pct_profit: f64,
+    trailing_retracement_pct_profit: f64,
+    trailing_threshold_pct_loss: f64,
+    trailing_retracement_pct_loss: f64,
+    fee_rate: f64,
+    adx_scale_higher_width: f64,
+    adx_scale_lower_width: f64,
+    max_flips_per_cycle: usize,
+) -> (Vec<(usize, f64, f64, f64, f64, f64, f64, f64, f64, String)>, Vec<f64>, usize) {
+    let mut extrema = TrailingExtrema {
+        max_since_open: 0.0,
+        min_since_max: f64::INFINITY,
+        min_since_open: f64::INFINITY,
+        max_since_min: 0.0,
+    };
+    let mut balance = start_balance;
+    let mut pos = Position { qty: 0.0, price: 0.0 };
+    let mut open_order = Order { qty: 0.0, price: 0.0 };
+    let mut fills_out: Vec<(usize, f64, f64, f64, f64, f64, f64, f64, f64, String)> = Vec::new();
+    let mut equities: Vec<f64> = Vec::new();
+
+    let mut flip_count = 0;
+
+    let n_bars = hlcv.shape()[0];
+
+    for i in 0..n_bars {
+        let row = hlcv.row(i);
+        let high = row[0];
+        let low = row[1];
+        let close = row[2];
+        let _vol = row[3];
+        let adx_1_val = adx_1[i];
+        let adx_2_val = adx_2[i];
+
+        // Check if the open order would have been filled this bar.
+        if (open_order.qty > 0.0 && low < open_order.price)
+            || (open_order.qty < 0.0 && high > open_order.price)
+        {
+            // Fill the order(s) and reset trailing extrema.
+            let fills_batch: Vec<Fill> = process_fill(pos, open_order, fee_rate);
+            for fill in fills_batch {
+                // Apply realised PnL and deduct fee from balance
+                balance += fill.pnl - fill.fee_paid;
+
+                pos = Position {
+                    qty: fill.pos_size_after_fill,
+                    price: fill.pos_price_after_fill,
+                };
+                fills_out.push((
+                    i,
+                    fill.pnl,      // realised PnL (pre-fee)
+                    fill.fee_paid, // fee paid for this fill
+                    balance,       // balance AFTER fee deduction
+                    fill.qty,
+                    fill.price,
+                    fill.pos_size_after_fill,
+                    fill.pos_price_after_fill,
+                    0.0, // upnl set later
+                    fill.fill_type.as_str().to_string(),
+                ));
+            }
+            extrema = TrailingExtrema {
+                max_since_open: 0.0,
+                min_since_max: f64::INFINITY,
+                min_since_open: f64::INFINITY,
+                max_since_min: 0.0,
+            };
+        } else {
+            // Update trailing highs/lows when no fill occurs.
+            update_trailing_prices(&mut extrema, high, low, close);
+        }
+
+        // Scale thresholds dynamically based on ADX value.
+        let adx_scale = if adx_1_val > 30.0 && adx_2_val > 25.0 {
+            adx_scale_higher_width
+        } else if adx_1_val < 20.0 && adx_2_val < 20.0 {
+            adx_scale_lower_width
+        } else {
+            1.0
+        };
+
+        let trailing_threshold_pct_profit_dyn = trailing_threshold_pct_profit * adx_scale;
+        let trailing_threshold_pct_loss_dyn = trailing_threshold_pct_loss * adx_scale;
+        let trailing_retracement_pct_profit_dyn = trailing_retracement_pct_profit * adx_scale;
+        let trailing_retracement_pct_loss_dyn = trailing_retracement_pct_loss * adx_scale;
+
+        let (new_order, upnl, flip_triggered) = calc_open_order_and_upnl_with_flip_count(
+            trailing_threshold_pct_profit_dyn,
+            trailing_retracement_pct_profit_dyn,
+            trailing_threshold_pct_loss_dyn,
+            trailing_retracement_pct_loss_dyn,
+            wallet_exposure_limit,
+            double_down_factor,
+            initial_qty_pct,
+            balance,
+            pos,
+            high,
+            low,
+            close,
+            extrema,
+        );
+
+        if flip_triggered && max_flips_per_cycle > 0 {
+            flip_count += 1;
+        }
+
+        // End cycle if max flips reached (force close)
+        if max_flips_per_cycle > 0 && flip_count >= max_flips_per_cycle {
+            // Close position and reset flip count
+            open_order = Order { qty: -pos.qty, price: close };
+            flip_count = 0;
+        } else {
+            open_order = new_order;
+        }
+
+        equities.push(balance + upnl);
+
+        // If we recorded any fills at this bar, update their upnl to the current value.
+        if let Some(last) = fills_out.last_mut() {
+            if last.0 == i {
+                last.8 = upnl; // index 8 is upnl in the output tuple
+            }
+        }
+
+        // --- CYCLE END LOGIC ---
+        // End cycle if position is flat (closed in profit or after max flips)
+        if pos.qty == 0.0 && !fills_out.is_empty() {
+            // End of cycle: return everything up to this bar
+            return (fills_out, equities, i);
+        }
+    }
+
+    // If we reach the end of the slice without closing, return what we have
+    (fills_out, equities, n_bars.saturating_sub(1))
+}
+
+/// Multi-coin cycling backtest: only one coin is traded at a time, cycles through coins.
+/// Each cycle starts at the next bar after the previous cycle ends.
+/// Returns (fills, equities, coin_indices) for all cycles.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn backtest_trailing_flip_multi<'py>(
+    py: Python<'py>,
+    hlcvs: PyReadonlyArray3<'py, f64>,    // coins × bars × 4
+    adx_1s: PyReadonlyArray2<'py, f64>,   // coins × bars
+    adx_2s: PyReadonlyArray2<'py, f64>,   // coins × bars
+    initial_qty_pct: f64,
+    double_down_factor: f64,
+    wallet_exposure_limit: f64,
+    trailing_threshold_pct_profit: f64,
+    trailing_retracement_pct_profit: f64,
+    trailing_threshold_pct_loss: f64,
+    trailing_retracement_pct_loss: f64,
+    fee_rate: f64,
+    adx_scale_higher_width: f64,
+    adx_scale_lower_width: f64,
+    max_flips_per_cycle: usize,
+) -> PyResult<(
+    Vec<(usize, usize, f64, f64, f64, f64, f64, f64, f64, f64, String)>, // (bar, coin, pnl, fee, bal, qty, price, psize, pprice, upnl, typ)
+    Vec<f64>, // equity curve
+    Vec<usize>, // coin index per cycle
+)> {
+    let _ = py;
+    let hlcvs = hlcvs.as_array();
+    let adx_1s = adx_1s.as_array();
+    let adx_2s = adx_2s.as_array();
+
+    let n_coins = hlcvs.shape()[0];
+    let n_bars = hlcvs.shape()[1];
+
+    let mut balance = 100.0f64;
+    let mut bar = 0usize;
+    let mut coin_idx = 0usize;
+    let mut fills_all = Vec::new();
+    let mut equities = Vec::new();
+    let mut coin_indices = Vec::new();
+
+    while bar < n_bars {
+        // Select coin
+        let hlcv = hlcvs.index_axis(ndarray::Axis(0), coin_idx);
+        let adx_1 = adx_1s.index_axis(ndarray::Axis(0), coin_idx);
+        let adx_2 = adx_2s.index_axis(ndarray::Axis(0), coin_idx);
+
+        // Run a single-cycle backtest starting at `bar`
+        // You will need to refactor `backtest_trailing_flip` to allow:
+        // - starting from a given bar
+        // - passing in the current balance
+        // - returning the ending bar of the cycle
+
+        let (fills, eqs, cycle_end_bar) = backtest_trailing_flip_single_cycle(
+            &hlcv.slice(s![bar.., ..]),
+            &adx_1.slice(s![bar..]),
+            &adx_2.slice(s![bar..]),
+            balance,
+            initial_qty_pct,
+            double_down_factor,
+            wallet_exposure_limit,
+            trailing_threshold_pct_profit,
+            trailing_retracement_pct_profit,
+            trailing_threshold_pct_loss,
+            trailing_retracement_pct_loss,
+            fee_rate,
+            adx_scale_higher_width,
+            adx_scale_lower_width,
+            max_flips_per_cycle,
+        );
+
+        // Adjust indices to global bar index
+        for (i, fill) in fills.into_iter().enumerate() {
+            let global_bar = bar + i;
+            fills_all.push((
+                global_bar,      // bar
+                coin_idx,        // coin_idx
+                fill.1,          // pnl
+                fill.2,          // fee_paid
+                fill.3,          // balance
+                fill.4,          // qty
+                fill.5,          // price
+                fill.6,          // psize
+                fill.7,          // pprice
+                fill.8,          // upnl
+                fill.9.clone(),  // type (String)
+            ));
+        }
+        for eq in eqs {
+            equities.push(eq);
+        }
+        coin_indices.push(coin_idx);
+
+        // Update balance for next cycle
+        if let Some(last_eq) = equities.last() {
+            balance = *last_eq;
+        }
+
+        // Advance to next bar and coin
+        bar = bar + cycle_end_bar + 1;
+        coin_idx = (coin_idx + 1) % n_coins;
+    }
+
+    Ok((fills_all, equities, coin_indices))
 }

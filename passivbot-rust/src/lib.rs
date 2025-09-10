@@ -6,6 +6,7 @@ mod python;
 mod trailing_flip;
 mod types;
 mod utils;
+mod ta;
 
 use backtest::*;
 use closes::*;

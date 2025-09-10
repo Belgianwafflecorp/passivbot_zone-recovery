@@ -2,6 +2,7 @@ use numpy::{PyReadonlyArray3 ,PyReadonlyArray2, PyReadonlyArray1};
 use pyo3::prelude::*;
 use ndarray::s;
 
+use crate::ta::adx::Adx;
 use crate::utils::{calc_pnl_long, calc_pnl_short};
 
 #[derive(Debug, Copy, Clone)]
@@ -361,8 +362,6 @@ fn calc_open_order_and_upnl_with_flip_count(
 pub fn backtest_trailing_flip<'py>(
     py: Python<'py>,
     hlcv: PyReadonlyArray2<'py, f64>, // accept ndarray directly
-    adx_1: PyReadonlyArray1<'py, f64>, // average directional index
-    adx_2: PyReadonlyArray1<'py, f64>, 
     initial_qty_pct: f64,
     double_down_factor: f64,
     wallet_exposure_limit: f64,
@@ -380,6 +379,8 @@ pub fn backtest_trailing_flip<'py>(
 )> {
     let _ = py; // silence unused if not needed
     let hlcv = hlcv.as_array(); // 2-D read-only ndarray view
+    let mut adx_1 = Adx::new(15);
+    let mut adx_2 = Adx::new(30);
 
     let mut extrema = TrailingExtrema {
         max_since_open: 0.0,
@@ -400,16 +401,14 @@ pub fn backtest_trailing_flip<'py>(
     let mut equities: Vec<f64> = Vec::new();
 
     let mut flip_count = 0;
-    let adx_1 = adx_1.as_array(); 
-    let adx_2 = adx_2.as_array();
 
     for (i, row) in hlcv.outer_iter().enumerate() {
         let high = row[0];
         let low = row[1];
         let close = row[2];
         let _vol = row[3];
-        let adx_1_val = adx_1[i];
-        let adx_2_val = adx_2[i];
+        let adx_1_val = adx_1.next(high, low, close).unwrap_or(0.0);
+        let adx_2_val = adx_2.next(high, low, close).unwrap_or(0.0);
 
         // Check if the open order would have been filled this bar.
         if (open_order.qty > 0.0 && low < open_order.price)
@@ -510,8 +509,6 @@ pub fn backtest_trailing_flip<'py>(
 /// Returns (fills, equities, bars_processed)
 fn backtest_trailing_flip_single_cycle(
     hlcv: &ndarray::ArrayView2<f64>,
-    adx_1: &ndarray::ArrayView1<f64>,
-    adx_2: &ndarray::ArrayView1<f64>,
     start_balance: f64,
     initial_qty_pct: f64,
     double_down_factor: f64,
@@ -525,6 +522,10 @@ fn backtest_trailing_flip_single_cycle(
     adx_scale_lower_width: f64,
     max_flips_per_cycle: usize,
 ) -> (Vec<(usize, f64, f64, f64, f64, f64, f64, f64, f64, String)>, Vec<f64>, usize) {
+    
+    let mut adx_1 = Adx::new(15);
+    let mut adx_2 = Adx::new(30);
+
     let mut extrema = TrailingExtrema {
         max_since_open: 0.0,
         min_since_max: f64::INFINITY,
@@ -547,8 +548,8 @@ fn backtest_trailing_flip_single_cycle(
         let low = row[1];
         let close = row[2];
         let _vol = row[3];
-        let adx_1_val = adx_1[i];
-        let adx_2_val = adx_2[i];
+        let adx_1_val = adx_1.next(high, low, close).unwrap_or(0.0);
+        let adx_2_val = adx_2.next(high, low, close).unwrap_or(0.0);
 
         // Check if the open order would have been filled this bar.
         if (open_order.qty > 0.0 && low < open_order.price)
@@ -660,8 +661,6 @@ fn backtest_trailing_flip_single_cycle(
 pub fn backtest_trailing_flip_multi<'py>(
     py: Python<'py>,
     hlcvs: PyReadonlyArray3<'py, f64>,    // coins × bars × 4
-    adx_1s: PyReadonlyArray2<'py, f64>,   // coins × bars
-    adx_2s: PyReadonlyArray2<'py, f64>,   // coins × bars
     initial_qty_pct: f64,
     double_down_factor: f64,
     wallet_exposure_limit: f64,
@@ -680,8 +679,6 @@ pub fn backtest_trailing_flip_multi<'py>(
 )> {
     let _ = py;
     let hlcvs = hlcvs.as_array();
-    let adx_1s = adx_1s.as_array();
-    let adx_2s = adx_2s.as_array();
 
     let n_coins = hlcvs.shape()[0];
     let n_bars = hlcvs.shape()[1];
@@ -696,8 +693,6 @@ pub fn backtest_trailing_flip_multi<'py>(
     while bar < n_bars {
         // Select coin
         let hlcv = hlcvs.index_axis(ndarray::Axis(0), coin_idx);
-        let adx_1 = adx_1s.index_axis(ndarray::Axis(0), coin_idx);
-        let adx_2 = adx_2s.index_axis(ndarray::Axis(0), coin_idx);
 
         // Run a single-cycle backtest starting at `bar`
         // You will need to refactor `backtest_trailing_flip` to allow:
@@ -707,8 +702,6 @@ pub fn backtest_trailing_flip_multi<'py>(
 
         let (fills, eqs, cycle_end_bar) = backtest_trailing_flip_single_cycle(
             &hlcv.slice(s![bar.., ..]),
-            &adx_1.slice(s![bar..]),
-            &adx_2.slice(s![bar..]),
             balance,
             initial_qty_pct,
             double_down_factor,

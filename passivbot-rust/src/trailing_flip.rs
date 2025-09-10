@@ -351,6 +351,48 @@ fn calc_open_order_and_upnl_with_flip_count(
     )
 }
 
+/// Returns the index of the coin with the highest average ADX (window=30) over the last 30 bars.
+/// If tied, picks the one with highest volume on the last bar.
+fn find_best_coin_by_adx_and_volume(hlcvs: &ndarray::ArrayView3<f64>, bar: usize) -> usize {
+    let n_coins = hlcvs.shape()[0];
+    let n_bars = hlcvs.shape()[1];
+    let window = 30;
+    let mut best_idx = 0;
+    let mut best_adx = f64::MIN;
+    let mut best_vol = 0.0;
+
+    for coin_idx in 0..n_coins {
+        // If not enough bars, skip
+        if bar + 1 < window {
+            continue;
+        }
+        let hlcv = hlcvs.index_axis(ndarray::Axis(0), coin_idx);
+        let mut adx = Adx::new(window);
+        let mut adx_vals = Vec::new();
+        for i in (bar + 1 - window)..=bar {
+            let row = hlcv.row(i);
+            let high = row[0];
+            let low = row[1];
+            let close = row[2];
+            let val = adx.next(high, low, close);
+            if let Some(v) = val {
+                adx_vals.push(v);
+            }
+        }
+        if adx_vals.is_empty() {
+            continue;
+        }
+        let avg_adx = adx_vals.iter().sum::<f64>() / adx_vals.len() as f64;
+        let vol = hlcv.row(bar)[3];
+        if avg_adx > best_adx || (avg_adx == best_adx && vol > best_vol) {
+            best_adx = avg_adx;
+            best_idx = coin_idx;
+            best_vol = vol;
+        }
+    }
+    best_idx
+}
+
 /// Run a simple backtest using trailing-stop and flip logic.
 ///
 /// Returns `(fills, equities)` where:
@@ -685,13 +727,13 @@ pub fn backtest_trailing_flip_multi<'py>(
 
     let mut balance = 100.0f64;
     let mut bar = 0usize;
-    let mut coin_idx = 0usize;
     let mut fills_all = Vec::new();
     let mut equities = Vec::new();
     let mut coin_indices = Vec::new();
 
     while bar < n_bars {
-        // Select coin
+        // Select coin with highest average ADX over last 30 bars
+        let coin_idx = find_best_coin_by_adx_and_volume(&hlcvs, bar);
         let hlcv = hlcvs.index_axis(ndarray::Axis(0), coin_idx);
 
         // Run a single-cycle backtest starting at `bar`
@@ -745,7 +787,6 @@ pub fn backtest_trailing_flip_multi<'py>(
 
         // Advance to next bar and coin
         bar = bar + cycle_end_bar + 1;
-        coin_idx = (coin_idx + 1) % n_coins;
     }
 
     Ok((fills_all, equities, coin_indices))
